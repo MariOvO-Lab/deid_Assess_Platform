@@ -31,21 +31,63 @@ class ReportGenerator:
         hdr_cells[0].text = '评估指标'
         hdr_cells[1].text = '结果'
         
+        # 处理特殊情况
+        smallest_classes = evaluation_results.pop('前5个最小等价类', None)
+        violating_classes = evaluation_results.pop('违规等价类', None)
+        
         for key, value in evaluation_results.items():
             row_cells = table.add_row().cells
             row_cells[0].text = key
             row_cells[1].text = str(value)
         
+        # 添加前5个最小等价类信息
+        if smallest_classes:
+            doc.add_heading('前5个最小等价类', level=2)
+            # 使用表格显示
+            class_table = doc.add_table(rows=1, cols=3)
+            class_hdr_cells = class_table.rows[0].cells
+            class_hdr_cells[0].text = '排名'
+            class_hdr_cells[1].text = '大小'
+            class_hdr_cells[2].text = '值'
+            
+            for i, cls in enumerate(smallest_classes):
+                row_cells = class_table.add_row().cells
+                row_cells[0].text = str(i+1)
+                row_cells[1].text = str(cls['size'])
+                row_cells[2].text = str(cls['values'])
+        
+        # 添加违规等价类信息
+        if violating_classes:
+            doc.add_heading('违规等价类（不满足K值）', level=2)
+            # 使用表格显示
+            violating_table = doc.add_table(rows=1, cols=3)
+            violating_hdr_cells = violating_table.rows[0].cells
+            violating_hdr_cells[0].text = '排名'
+            violating_hdr_cells[1].text = '大小'
+            violating_hdr_cells[2].text = '值'
+            
+            for i, cls in enumerate(violating_classes):
+                row_cells = violating_table.add_row().cells
+                row_cells[0].text = str(i+1)
+                row_cells[1].text = str(cls['size'])
+                row_cells[2].text = str(cls['values'])
+        
         # 添加结论部分
         doc.add_heading('结论', level=1)
         
         # 基于评估结果生成结论
-        reid_risk = float(evaluation_results.get('重识别风险基础评分', '0').replace('%', ''))
-        availability_loss = float(evaluation_results.get('可用性损失', '0').replace('%', ''))
+        # 获取重识别风险（新的指标名称）
+        reid_risk = float(evaluation_results.get('重识别风险上界', '0'))
+        # 转换为0-100的范围以便于等级判断
+        reid_risk *= 100
         
-        if reid_risk < 30:
+        # 获取可用性损失（已经是百分比字符串）
+        availability_loss_str = evaluation_results.get('可用性损失', '0%')
+        availability_loss = float(availability_loss_str.replace('%', ''))
+        
+        if reid_risk < 10:
             risk_level = '低'
-        elif reid_risk < 70:
+        elif reid_risk < 30:
             risk_level = '中'
         else:
             risk_level = '高'

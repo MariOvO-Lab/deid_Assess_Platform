@@ -1,4 +1,11 @@
-from PySide6.QtWidgets import QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QLabel, QTableWidget, QTableWidgetItem, QComboBox, QGridLayout, QGroupBox, QCheckBox, QMessageBox
+from PySide6.QtWidgets import QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QLabel, QTableWidget, QTableWidgetItem, QComboBox, QGridLayout, QGroupBox, QCheckBox, QMessageBox, QScrollArea, QTextEdit
+from PySide6.QtCore import Qt
+import sys
+import os
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from core.classifier import Classifier
 from core.deidentify import Deidentifier
 from core.evaluate import Evaluator
@@ -47,35 +54,47 @@ class MainWindow(QMainWindow):
         self.setup_report_tab()
         
         # 数据存储
-        self.data = None
+        self.data = None  # 原始数据
+        self.deid_data = None  # 去标识化后的数据（无论是平台生成的还是用户上传的）
+        self.uploaded_deid_data = None  # 用户上传的去标识化数据
         self.classified_fields = {}
         self.deid_strategies = {}
         self.evaluation_results = {}
         self.qi_columns = []  # 存储准标识符列
+        self.k_meta = None  # K-匿名元信息
     
     def setup_data_tab(self):
         layout = QVBoxLayout()
         self.data_tab.setLayout(layout)
         
-        # 导入按钮
-        import_layout = QHBoxLayout()
-        self.import_btn = QPushButton("导入文件")
-        self.import_btn.clicked.connect(self.import_file)
-        import_layout.addWidget(self.import_btn)
-        self.file_label = QLabel("未选择文件")
-        import_layout.addWidget(self.file_label)
-        layout.addLayout(import_layout)
+        # 原始数据导入
+        original_layout = QHBoxLayout()
+        self.import_original_btn = QPushButton("导入原始文件")
+        self.import_original_btn.clicked.connect(self.import_original_file)
+        original_layout.addWidget(self.import_original_btn)
+        self.original_file_label = QLabel("未选择文件")
+        original_layout.addWidget(self.original_file_label)
+        layout.addLayout(original_layout)
+        
+        # 匿名化数据导入
+        deid_layout = QHBoxLayout()
+        self.import_deid_btn = QPushButton("导入匿名化文件")
+        self.import_deid_btn.clicked.connect(self.import_deid_file)
+        deid_layout.addWidget(self.import_deid_btn)
+        self.deid_file_label = QLabel("未选择文件")
+        deid_layout.addWidget(self.deid_file_label)
+        layout.addLayout(deid_layout)
         
         # 数据预览表格
         self.data_table = QTableWidget()
         layout.addWidget(self.data_table)
     
-    def import_file(self):
+    def import_original_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择文件", "", "数据文件 (*.csv *.xlsx *.json *.parquet)"
+            self, "选择原始文件", "", "数据文件 (*.csv *.xlsx *.json *.parquet)"
         )
         if file_path:
-            self.file_label.setText(file_path)
+            self.original_file_label.setText(file_path)
             # 读取文件
             try:
                 if file_path.endswith('.csv'):
@@ -87,23 +106,50 @@ class MainWindow(QMainWindow):
                 elif file_path.endswith('.parquet'):
                     self.data = pl.read_parquet(file_path)
                 else:
-                    self.file_label.setText("不支持的文件格式")
+                    self.original_file_label.setText("不支持的文件格式")
                     return
                 
                 # 显示数据预览
-                self.update_data_table()
+                self.update_data_table(data=self.data)
             except Exception as e:
-                self.file_label.setText(f"读取失败: {str(e)}")
+                self.original_file_label.setText(f"读取失败: {str(e)}")
     
-    def update_data_table(self):
-        if self.data is not None:
+    def import_deid_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择匿名化文件", "", "数据文件 (*.csv *.xlsx *.json *.parquet)"
+        )
+        if file_path:
+            self.deid_file_label.setText(file_path)
+            # 读取文件
+            try:
+                if file_path.endswith('.csv'):
+                    self.uploaded_deid_data = pl.read_csv(file_path)
+                elif file_path.endswith('.xlsx'):
+                    self.uploaded_deid_data = pl.read_excel(file_path)
+                elif file_path.endswith('.json'):
+                    self.uploaded_deid_data = pl.read_json(file_path)
+                elif file_path.endswith('.parquet'):
+                    self.uploaded_deid_data = pl.read_parquet(file_path)
+                else:
+                    self.deid_file_label.setText("不支持的文件格式")
+                    return
+                
+                # 显示数据预览
+                self.update_data_table(data=self.uploaded_deid_data)
+            except Exception as e:
+                self.deid_file_label.setText(f"读取失败: {str(e)}")
+    
+    def update_data_table(self, data=None):
+        # 如果没有提供数据，使用原始数据
+        preview_data = data if data is not None else self.data
+        
+        if preview_data is not None:
             # 不限制预览行数，显示完整数据
-            preview_data = self.data
             rows, cols = preview_data.shape
             
             # 限制显示行数，避免性能问题
             display_rows = min(1000, rows)
-            preview_data = self.data.head(display_rows)
+            preview_data = preview_data.head(display_rows)
             
             self.data_table.setRowCount(display_rows)
             self.data_table.setColumnCount(cols)
@@ -128,11 +174,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.classify_table)
     
     def classify_fields(self):
-        if self.data is None:
+        # 优先使用原始数据进行字段分类
+        classify_data = self.data
+        
+        if classify_data is None:
             return
         
         classifier = Classifier()
-        self.classified_fields = classifier.classify(self.data)
+        self.classified_fields = classifier.classify(classify_data)
         
         # 显示分类结果
         cols = list(self.classified_fields.keys())
@@ -177,8 +226,8 @@ class MainWindow(QMainWindow):
             
             # 添加复选框
             checkbox = QCheckBox()
-            # 默认选中准标识符和敏感属性
-            if classification in ["quasi", "sensitive"]:
+            # 默认只选中准标识符，不选中敏感属性
+            if classification == "quasi":
                 checkbox.setChecked(True)
             else:
                 checkbox.setChecked(False)
@@ -264,7 +313,7 @@ class MainWindow(QMainWindow):
             
             # 执行去标识化
             deidentifier = Deidentifier()
-            self.deid_data = deidentifier.deidentify(self.data, strategies)
+            self.deid_data, self.k_meta = deidentifier.deidentify(self.data, strategies)
             
             # 显示结果预览
             if self.deid_data is not None:
@@ -297,31 +346,137 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         self.evaluate_tab.setLayout(layout)
         
-        # 评估按钮
+        # 评估按钮（放在顶部）
         evaluate_btn = QPushButton("评估效果")
         evaluate_btn.clicked.connect(self.evaluate)
         layout.addWidget(evaluate_btn)
         
-        # 评估结果
+        # 创建可滚动区域（关键修复）
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumHeight(400)  # 给足够初始高度
+        
+        # 评估结果 GroupBox
         self.evaluate_group = QGroupBox("评估结果")
         self.evaluate_group_layout = QVBoxLayout()
         self.evaluate_group.setLayout(self.evaluate_group_layout)
-        layout.addWidget(self.evaluate_group)
-    
+        
+        scroll.setWidget(self.evaluate_group)
+        layout.addWidget(scroll)
+        
     def evaluate(self):
-        if self.deid_data is None:
+       # 获取目标K值
+        k_target = None
+        try:
+            if hasattr(self, 'k_value_input'):
+                k_target = int(self.k_value_input.currentText())
+        except (AttributeError, ValueError):
+            pass
+
+        # 收集准标识符（确保直接上传匿名化文件时也能正确获取）
+        if hasattr(self, 'qi_list_widget'):
+            qi_columns = []
+            for i in range(self.qi_list_widget.rowCount()):
+                checkbox = self.qi_list_widget.cellWidget(i, 1)
+                if checkbox.isChecked():
+                    field_name = self.qi_list_widget.item(i, 0).text()
+                    qi_columns.append(field_name)
+            self.qi_columns = qi_columns
+
+        # 执行评估
+        if self.data is not None and self.uploaded_deid_data is not None:
+            evaluator = Evaluator()
+            self.evaluation_results = evaluator.evaluate(
+                self.data, 
+                self.uploaded_deid_data, 
+                self.classified_fields, 
+                self.qi_columns,
+                k_target=k_target
+            )
+        elif self.deid_data is not None:
+            evaluator = Evaluator()
+            self.evaluation_results = evaluator.evaluate(
+                self.deid_data, 
+                self.deid_data, 
+                self.classified_fields, 
+                self.qi_columns, 
+                getattr(self, 'k_meta', None),
+                k_target=k_target
+            )
+        else:
+            QMessageBox.warning(self, "警告", "请先完成数据导入和去标识化！")
             return
-        
-        evaluator = Evaluator()
-        self.evaluation_results = evaluator.evaluate(self.deid_data, self.classified_fields, self.qi_columns)
-        
-        # 显示评估结果
+
+        # 清空旧结果
         for i in reversed(range(self.evaluate_group_layout.count())):
             self.evaluate_group_layout.itemAt(i).widget().deleteLater()
-        
+
+        # 逐个显示评估结果（优化等价类展示）
         for key, value in self.evaluation_results.items():
-            label = QLabel(f"{key}: {value}")
-            self.evaluate_group_layout.addWidget(label)
+            # 跳过不需要显示的字段
+            if key in ["前5个最小等价类_格式化", "违规等价类_格式化", "original_rows", "deid_rows", "original_columns", "deid_columns"]:
+                continue
+                
+            if key in ["前5个最小等价类", "违规等价类"] and isinstance(value, list):
+                # 创建标题标签
+                title_label = QLabel(f"<b>{key}：</b>")
+                self.evaluate_group_layout.addWidget(title_label)
+
+                if not value:
+                    none_label = QLabel("（无符合条件的等价类）")
+                    self.evaluate_group_layout.addWidget(none_label)
+                    continue
+
+                # 创建表格显示等价类
+                table = QTableWidget()
+                table.setRowCount(len(value))
+                table.setColumnCount(3)
+                table.setHorizontalHeaderLabels(["排名", "等价类大小", "准标识符取值组合"])
+
+                for row_idx, cls in enumerate(value):
+                    # 排名
+                    table.setItem(row_idx, 0, QTableWidgetItem(str(row_idx + 1)))
+
+                    # 大小
+                    table.setItem(row_idx, 1, QTableWidgetItem(str(cls.get("size", 0))))
+
+                    # 值组合 —— 优化为多行清晰格式
+                    values = cls.get("values", {})
+                    value_lines = []
+                    for col in self.qi_columns:   # 使用当前有效的 qi_columns
+                        val = values.get(col, "")
+                        value_lines.append(f"{col}: {val}")
+                    value_str = "\n".join(value_lines)
+
+                    item = QTableWidgetItem(value_str)
+                    item.setTextAlignment(0x0001 | 0x0080)  # 左对齐 + 垂直居中
+                    table.setItem(row_idx, 2, item)
+
+                # 表格样式优化
+                table.resizeColumnsToContents()
+                table.setMinimumWidth(850)
+                table.setColumnWidth(0, 60)   # 排名
+                table.setColumnWidth(1, 100)  # 大小
+                table.setColumnWidth(2, 650)  # 值组合（给足够宽度）
+                table.setWordWrap(True)       # 关键：允许自动换行
+                table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # 垂直滚动
+                table.verticalHeader().setDefaultSectionSize(60)  # 增大行高，让多行更清晰
+
+                self.evaluate_group_layout.addWidget(table)
+
+            else:
+                # 普通指标（保持单行显示）
+                if isinstance(value, (int, float)):
+                    display_value = f"{value:.4f}" if isinstance(value, float) else str(value)
+                else:
+                    display_value = str(value)
+                label = QLabel(f"<b>{key}：</b> {display_value}")
+                self.evaluate_group_layout.addWidget(label)
+
+        # 底部间距
+        spacer = QWidget()
+        spacer.setMinimumHeight(20)
+        self.evaluate_group_layout.addWidget(spacer)
     
     def setup_report_tab(self):
         layout = QVBoxLayout()
