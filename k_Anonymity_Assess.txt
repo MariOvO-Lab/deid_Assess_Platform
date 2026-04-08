@@ -1,0 +1,455 @@
+import pandas as pd
+import numpy as np
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================
+# 1. 文件读取工具（支持 .csv / .data / .tsv / .txt）
+# ============================================================
+
+def load_file(filepath: str, has_header: bool = True, column_names: list = None) -> pd.DataFrame:
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    ext = os.path.splitext(filepath)[-1].lower()
+    sep_map = {
+        '.csv':  ',',
+        '.data': ',',
+        '.tsv':  '\t',
+        '.txt':  ',',
+    }
+    sep = sep_map.get(ext, ',')
+
+    header = 0 if has_header else None
+    df = pd.read_csv(
+        filepath,
+        sep=sep,
+        header=header,
+        names=column_names,
+        na_values=['?', 'NA', 'N/A', '', ' '],
+        skipinitialspace=True,
+        engine='python',
+    )
+    df = df.dropna().reset_index(drop=True)
+
+    if not has_header and column_names is None:
+        df.columns = [f"col_{i}" for i in range(len(df.columns))]
+
+    print(f"✅ 成功读取: {filepath}  [{len(df)} 行 × {len(df.columns)} 列]")
+    return df
+
+
+# ============================================================
+# 2. 通用K匿名强度评测器
+# ============================================================
+
+class KAnonymityEvaluator:
+
+    def __init__(self, qi_columns: list = None, sensitive_columns: list = None):
+        self.qi_columns = qi_columns
+        self.sensitive_columns = sensitive_columns
+
+    # ------------------------------------------------------------------ #
+    #  自动推断准标识符
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _auto_detect_qi(df: pd.DataFrame) -> list:
+        """
+        自动检测疑似准标识符列：
+        - 包含 '*' 通配符的列         → 明确是泛化后的 QI
+        - 包含 '数字-数字' 区间格式    → 明确是泛化后的数值 QI
+        - 基数在 2 ~ 100 之间的列      → 疑似类别型 QI
+          （注意：此处无法区分 QI 与敏感属性，强烈建议手动指定）
+        - 排除高基数数值列（疑似权重/ID）
+        """
+        qi = []
+        for col in df.columns:
+            series      = df[col].astype(str)
+            has_wildcard = series.str.contains(r'^\*$', regex=True).any()
+            has_range    = series.str.match(r'^\d+-\d+$').any()
+            cardinality  = df[col].nunique()
+            # 基数在 2~100 之间视为疑似 QI（涵盖 sex 这类二值列）
+            low_cardinality = 2 <= cardinality <= 100
+
+            if has_wildcard or has_range or low_cardinality:
+                qi.append(col)
+        return qi
+
+    @staticmethod
+    def _auto_detect_sensitive(df: pd.DataFrame, qi_columns: list) -> list:
+        return [c for c in df.columns if c not in qi_columns]
+
+    # ------------------------------------------------------------------ #
+    #  核心指标
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _equivalence_classes(df: pd.DataFrame, qi_cols: list) -> pd.Series:
+        return df.groupby(qi_cols, sort=False).size()
+
+    @staticmethod
+    def _compute_k(eq_sizes: pd.Series) -> int:
+        return int(eq_sizes.min())
+
+    @staticmethod
+    def _compute_normalized_certainty_penalty(df: pd.DataFrame, qi_cols: list) -> float:
+        ncp_total = 0.0
+        for col in qi_cols:
+            series   = df[col].astype(str)
+            is_range = series.str.match(r'^\d+-\d+$')
+            if is_range.any():
+                lows, highs = [], []
+                for v in series:
+                    parts = v.split('-')
+                    if len(parts) == 2:
+                        try:
+                            lows.append(int(parts[0]))
+                            highs.append(int(parts[1]))
+                        except ValueError:
+                            pass
+                if lows:
+                    global_range = max(highs) - min(lows)
+                    if global_range == 0:
+                        continue
+                    widths = [h - l for l, h in zip(lows, highs)]
+                    ncp_total += np.mean(widths) / global_range
+            else:
+                global_card = df[col].nunique()
+                if global_card <= 1:
+                    continue
+                group_card = df.groupby(qi_cols)[col].transform('nunique')
+                ncp_total += (group_card / global_card).mean()
+        return ncp_total / len(qi_cols) if qi_cols else 0.0
+
+    @staticmethod
+    def _discernibility_metric(eq_sizes: pd.Series, total_rows: int) -> float:
+        return float((eq_sizes ** 2).sum()) / (total_rows ** 2)
+
+    @staticmethod
+    def _average_equivalence_class_size(eq_sizes: pd.Series, total_rows: int) -> float:
+        return total_rows / len(eq_sizes)
+
+    @staticmethod
+    def _eq_size_distribution(eq_sizes: pd.Series) -> dict:
+        return {
+            'min':    int(eq_sizes.min()),
+            'max':    int(eq_sizes.max()),
+            'mean':   float(eq_sizes.mean()),
+            'median': float(eq_sizes.median()),
+            'std':    float(eq_sizes.std()),
+            'count':  int(len(eq_sizes)),
+        }
+
+    @staticmethod
+    def _reidentification_risk(eq_sizes: pd.Series) -> float:
+        return float((1.0 / eq_sizes).mean())
+
+    @staticmethod
+    def _generalization_height(df: pd.DataFrame, qi_cols: list) -> dict:
+        result = {}
+        for col in qi_cols:
+            series = df[col].astype(str)
+            wildcard_ratio = (series == '*').mean()
+            is_range = series.str.match(r'^\d+-\d+$')
+            if is_range.any():
+                spans = []
+                for v in series[is_range]:
+                    parts = v.split('-')
+                    if len(parts) == 2:
+                        try:
+                            spans.append(int(parts[1]) - int(parts[0]))
+                        except ValueError:
+                            pass
+                result[col] = {
+                    'wildcard_ratio': float(wildcard_ratio),
+                    'avg_range_span': float(np.mean(spans)) if spans else None,
+                }
+            else:
+                result[col] = {
+                    'wildcard_ratio': float(wildcard_ratio),
+                    'avg_range_span': None,
+                }
+        return result
+
+    @staticmethod
+    def _information_loss_ratio(orig_df, anon_df, qi_cols) -> float:
+        total_orig = sum(orig_df[c].nunique() for c in qi_cols if c in orig_df.columns)
+        total_anon = sum(anon_df[c].nunique() for c in qi_cols if c in anon_df.columns)
+        if total_orig == 0:
+            return 0.0
+        return (total_orig - total_anon) / total_orig
+
+    @staticmethod
+    def _compute_strength_score(actual_k, ncp, eq_sizes) -> float:
+        k_score       = min(np.log1p(actual_k) / np.log1p(100), 1.0) * 40
+        ncp_score     = (1.0 - min(ncp, 1.0)) * 30
+        cv            = eq_sizes.std() / eq_sizes.mean() if eq_sizes.mean() > 0 else 1.0
+        balance_score = max(0.0, 1.0 - cv / 5.0) * 30
+        return k_score + ncp_score + balance_score
+
+    # ------------------------------------------------------------------ #
+    #  【新增】打印不满足 K 的等价类示例
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _print_violations(df: pd.DataFrame, qi_cols: list, k: int, max_show: int = 10):
+        """
+        找出所有等价类大小 < k 的记录，打印其 QI 组合与实际大小。
+
+        Parameters
+        ----------
+        df       : 匿名化后的 DataFrame
+        qi_cols  : 准标识符列表
+        k        : 目标K值
+        max_show : 最多显示的违规等价类数量
+        """
+        groups    = df.groupby(qi_cols, sort=False).size().reset_index(name='等价类大小')
+        violations = groups[groups['等价类大小'] < k].sort_values('等价类大小')
+
+        if violations.empty:
+            print(f"\n  ✅ 所有等价类均满足 K={k}，无违规记录。")
+            return
+
+        print(f"\n  ❌ 共发现 {len(violations)} 个不满足 K={k} 的等价类")
+        show = violations.head(max_show)
+        print(f"  （以下展示前 {len(show)} 个，按等价类大小升序排列）\n")
+        print(f"  {'序号':<6}", end='')
+        for col in qi_cols:
+            print(f"{col:<20}", end='')
+        print(f"{'等价类大小':>10}")
+        print("  " + "-" * (6 + 20 * len(qi_cols) + 10))
+
+        for i, (_, row) in enumerate(show.iterrows(), 1):
+            print(f"  {i:<6}", end='')
+            for col in qi_cols:
+                val = str(row[col])
+                print(f"{val:<20}", end='')
+            print(f"{int(row['等价类大小']):>10}")
+
+        if len(violations) > max_show:
+            print(f"\n  ... 还有 {len(violations) - max_show} 个违规等价类未显示")
+        print()
+
+    # ------------------------------------------------------------------ #
+    #  格式化打印报告
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _print_report(report: dict):
+        print("\n" + "-" * 65)
+        print("  【基础 K 匿名指标】")
+        if 'original_k' in report:
+            print(f"    原始数据实际K值         : {report['original_k']}")
+        print(f"    匿名后实际K值           : {report['actual_k']}")
+        if report.get('k_target_satisfied') is not None:
+            status = "✅ 达标" if report['k_target_satisfied'] else "❌ 未达标"
+            print(f"    目标K满足情况           : {status}")
+        if 'k_improvement' in report:
+            print(f"    K值提升量               : +{report['k_improvement']}")
+
+        print("\n  【信息损失指标】")
+        print(f"    归一化确定性惩罚(NCP)   : {report['ncp']:.4f}  (0最优, 1最差)")
+        print(f"    可辨别性度量(DM)        : {report['discernibility_metric']:.6f}")
+        if 'information_loss_ratio' in report:
+            print(f"    信息损失比率            : {report['information_loss_ratio']:.4f}")
+
+        print("\n  【等价类分布】")
+        d = report['eq_size_distribution']
+        print(f"    等价类总数              : {d['count']}")
+        print(f"    平均等价类大小(AECS)    : {report['avg_equivalence_class_size']:.2f}")
+        print(f"    最小 / 最大 / 均值      : {d['min']} / {d['max']} / {d['mean']:.2f}")
+        print(f"    中位数 / 标准差         : {d['median']:.2f} / {d['std']:.2f}")
+
+        print("\n  【隐私风险】")
+        print(f"    重识别风险上界          : {report['reidentification_risk']:.6f}")
+
+        print("\n  【泛化深度（各准标识符）】")
+        for col, gh in report['generalization_height'].items():
+            wr       = gh['wildcard_ratio']
+            span     = gh['avg_range_span']
+            span_str = f", 平均区间跨度={span:.1f}" if span is not None else ""
+            print(f"    {col:<22}: 通配符占比={wr:.2%}{span_str}")
+
+        print("\n" + "-" * 65)
+        score = report['strength_score']
+        level = ("极强 🟢" if score >= 80 else
+                 "较强 🟡" if score >= 60 else
+                 "一般 🟠" if score >= 40 else
+                 "较弱 🔴")
+        print(f"  ★ 综合匿名强度评分 : {score:.2f} / 100  [{level}]")
+        print("=" * 65)
+
+    # ------------------------------------------------------------------ #
+    #  Mode 1
+    # ------------------------------------------------------------------ #
+    def evaluate_mode1(self, anon_df: pd.DataFrame, k_target: int = None) -> dict:
+        print("\n" + "=" * 65)
+        print("  K匿名强度评测 — Mode 1（仅匿名化数据集）")
+        print("=" * 65)
+
+        qi_cols   = self.qi_columns   or self._auto_detect_qi(anon_df)
+        sens_cols = self.sensitive_columns or self._auto_detect_sensitive(anon_df, qi_cols)
+
+        print(f"  当前准标识符(QI) : {qi_cols}")
+        print(f"  当前敏感属性     : {sens_cols}")
+        print(f"  数据集规模       : {len(anon_df)} 行 × {len(anon_df.columns)} 列")
+
+        eq_sizes = self._equivalence_classes(anon_df, qi_cols)
+        actual_k = self._compute_k(eq_sizes)
+        ncp      = self._compute_normalized_certainty_penalty(anon_df, qi_cols)
+        dm       = self._discernibility_metric(eq_sizes, len(anon_df))
+        aecs     = self._average_equivalence_class_size(eq_sizes, len(anon_df))
+        dist     = self._eq_size_distribution(eq_sizes)
+        gh       = self._generalization_height(anon_df, qi_cols)
+        reid     = self._reidentification_risk(eq_sizes)
+        score    = self._compute_strength_score(actual_k, ncp, eq_sizes)
+
+        report = {
+            'mode':                       1,
+            'dataset_rows':               len(anon_df),
+            'qi_columns':                 qi_cols,
+            'sensitive_columns':          sens_cols,
+            'actual_k':                   actual_k,
+            'k_target_satisfied':         (actual_k >= k_target) if k_target else None,
+            'ncp':                        round(ncp, 4),
+            'discernibility_metric':      round(dm, 6),
+            'avg_equivalence_class_size': round(aecs, 2),
+            'eq_size_distribution':       dist,
+            'generalization_height':      gh,
+            'reidentification_risk':      round(reid, 6),
+            'strength_score':             round(score, 2),
+        }
+
+        self._print_report(report)
+
+        # 打印不满足 K 的等价类示例
+        if k_target:
+            print("  【不满足目标K的等价类示例】")
+            self._print_violations(anon_df, qi_cols, k_target)
+
+        return report
+
+    # ------------------------------------------------------------------ #
+    #  Mode 2
+    # ------------------------------------------------------------------ #
+    def evaluate_mode2(self, orig_df: pd.DataFrame, anon_df: pd.DataFrame,
+                       k_target: int = None) -> dict:
+        print("\n" + "=" * 65)
+        print("  K匿名强度评测 — Mode 2（原始 + 匿名化数据集对比）")
+        print("=" * 65)
+
+        qi_cols   = self.qi_columns   or self._auto_detect_qi(anon_df)
+        sens_cols = self.sensitive_columns or self._auto_detect_sensitive(anon_df, qi_cols)
+
+        print(f"  当前准标识符(QI) : {qi_cols}")
+        print(f"  当前敏感属性     : {sens_cols}")
+        print(f"  原始数据规模     : {len(orig_df)} 行 × {len(orig_df.columns)} 列")
+        print(f"  匿名数据规模     : {len(anon_df)} 行 × {len(anon_df.columns)} 列")
+
+        eq_sizes      = self._equivalence_classes(anon_df, qi_cols)
+        actual_k      = self._compute_k(eq_sizes)
+        ncp           = self._compute_normalized_certainty_penalty(anon_df, qi_cols)
+        dm            = self._discernibility_metric(eq_sizes, len(anon_df))
+        aecs          = self._average_equivalence_class_size(eq_sizes, len(anon_df))
+        dist          = self._eq_size_distribution(eq_sizes)
+        gh            = self._generalization_height(anon_df, qi_cols)
+        reid          = self._reidentification_risk(eq_sizes)
+        score         = self._compute_strength_score(actual_k, ncp, eq_sizes)
+        orig_eq_sizes = self._equivalence_classes(orig_df, qi_cols)
+        orig_k        = self._compute_k(orig_eq_sizes)
+        il_ratio      = self._information_loss_ratio(orig_df, anon_df, qi_cols)
+
+        report = {
+            'mode':                       2,
+            'dataset_rows':               len(anon_df),
+            'qi_columns':                 qi_cols,
+            'sensitive_columns':          sens_cols,
+            'original_k':                 orig_k,
+            'actual_k':                   actual_k,
+            'k_improvement':              actual_k - orig_k,
+            'k_target_satisfied':         (actual_k >= k_target) if k_target else None,
+            'ncp':                        round(ncp, 4),
+            'discernibility_metric':      round(dm, 6),
+            'avg_equivalence_class_size': round(aecs, 2),
+            'eq_size_distribution':       dist,
+            'generalization_height':      gh,
+            'information_loss_ratio':     round(il_ratio, 4),
+            'reidentification_risk':      round(reid, 6),
+            'strength_score':             round(score, 2),
+        }
+
+        self._print_report(report)
+
+        # 打印不满足 K 的等价类示例
+        if k_target:
+            print("  【不满足目标K的等价类示例】")
+            self._print_violations(anon_df, qi_cols, k_target)
+
+        return report
+
+
+# ============================================================
+# 3. 主程序入口
+# ============================================================
+
+if __name__ == '__main__':
+
+    print("=" * 65)
+    print("  K匿名强度评测系统")
+    print("=" * 65)
+    print("\n请选择评测模式：")
+    print("  1 - Mode 1（仅提供匿名化后的数据集）")
+    print("  2 - Mode 2（同时提供加密前后的数据集）")
+    mode = input("输入模式编号 [默认2]: ").strip() or '2'
+
+    has_header_input = input("\n文件是否含表头？(y/n) [默认y]: ").strip().lower() or 'y'
+    has_header = (has_header_input == 'y')
+
+    col_names = None
+    if not has_header:
+        col_input = input("请输入列名（逗号分隔），留空则自动命名为 col_0, col_1, ...: ").strip()
+        if col_input:
+            col_names = [c.strip() for c in col_input.split(',')]
+
+    k_target = int(input("请输入目标K值 [默认5]: ").strip() or 5)
+
+    # 手动指定 QI（强烈建议，避免自动推断误判）
+    print("\n⚠️  提示：自动推断准标识符可能误判敏感属性（如 income）为 QI，")
+    print("   建议手动指定准标识符列名以确保 K 值计算准确。")
+    qi_input = input("请输入准标识符列名（逗号分隔），留空则自动推断: ").strip()
+    qi_cols  = [c.strip() for c in qi_input.split(',')] if qi_input else None
+
+    sens_input = input("请输入敏感属性列名（逗号分隔），留空则自动推断: ").strip()
+    sens_cols  = [c.strip() for c in sens_input.split(',')] if sens_input else None
+
+    if mode == '1':
+        # -------------------------------------------------------
+        # Mode 1：只需上传匿名化后的文件
+        # 文件路径示例：
+        #   Windows : C:\Users\yourname\data\adult_anonymized.csv
+        #   Mac/Linux: /home/yourname/data/adult_anonymized.data
+        #   同目录   : adult_anonymized.csv
+        # -------------------------------------------------------
+        anon_path = input("\n请输入匿名化数据文件路径（.csv 或 .data）: ").strip()
+        anon_df   = load_file(anon_path, has_header=has_header, column_names=col_names)
+        print(f"\n数据预览（前3行）:\n{anon_df.head(3)}\n")
+
+        evaluator = KAnonymityEvaluator(qi_columns=qi_cols, sensitive_columns=sens_cols)
+        evaluator.evaluate_mode1(anon_df, k_target=k_target)
+
+    else:
+        # -------------------------------------------------------
+        # Mode 2：分别上传原始文件和匿名化文件
+        # 文件路径示例：
+        #   原始文件 : adult.data  或  /home/yourname/data/adult.data
+        #   匿名文件 : adult_anonymized.csv
+        # -------------------------------------------------------
+        orig_path = input("\n请输入原始数据文件路径（.csv 或 .data）: ").strip()
+        anon_path = input("请输入匿名化数据文件路径（.csv 或 .data）: ").strip()
+
+        orig_df = load_file(orig_path, has_header=has_header, column_names=col_names)
+        anon_df = load_file(anon_path, has_header=has_header, column_names=col_names)
+        print(f"\n原始数据预览（前3行）:\n{orig_df.head(3)}\n")
+        print(f"匿名数据预览（前3行）:\n{anon_df.head(3)}\n")
+
+        evaluator = KAnonymityEvaluator(qi_columns=qi_cols, sensitive_columns=sens_cols)
+        evaluator.evaluate_mode2(orig_df, anon_df, k_target=k_target)

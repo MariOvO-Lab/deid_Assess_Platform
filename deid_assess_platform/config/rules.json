@@ -1,0 +1,36 @@
+{
+  "direct_identifiers": [
+    "姓名", "name", "fullname",
+    "身份证", "idcard", "identity", "id_number",
+    "手机号", "phone", "mobile", "cellphone",
+    "邮箱", "email", "mail",
+    "地址", "address",
+    "银行卡", "bank", "card",
+    "护照", "passport",
+    "社保", "social", "insurance",
+    "驾照", "driver", "license"
+  ],
+  "quasi_identifiers": [
+    "年龄", "age",
+    "性别", "gender", "sex",
+    "出生日期", "birth", "dob",
+    "邮编", "zip", "postal",
+    "地区", "region", "area",
+    "职业", "occupation", "job",
+    "教育", "education", "school"
+  ],
+  "sensitive_attributes": [
+    "健康", "health", "medical",
+    "疾病", "disease", "illness",
+    "诊断", "diagnosis",
+    "治疗", "treatment",
+    "用药", "medicine", "drug",
+    "基因", "gene",
+    "生物", "biometric",
+    "收入", "income", "salary",
+    "财务", "finance", "financial",
+    "宗教", "religion",
+    "政治", "political",
+    "民族", "ethnicity", "race"
+  ]
+}

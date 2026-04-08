@@ -1,0 +1,147 @@
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+
+# ============================================================
+# 1. 数据加载
+# ============================================================
+
+COLUMNS = [
+    'age', 'workclass', 'fnlwgt', 'education', 'education_num',
+    'marital_status', 'occupation', 'relationship', 'race', 'sex',
+    'capital_gain', 'capital_loss', 'hours_per_week', 'native_country', 'income'
+]
+
+# 准标识符（Quasi-Identifiers, QI）：用于K匿名化的属性
+QI_COLUMNS = ['age', 'education', 'race', 'sex', 'native_country']
+
+# 敏感属性
+SENSITIVE_COLUMN = 'income'
+
+
+def load_data(filepath):
+    df = pd.read_csv(filepath, header=None, names=COLUMNS,
+                     na_values='?', skipinitialspace=True)
+    df = df.dropna().reset_index(drop=True)
+    return df
+
+
+# ============================================================
+# 2. 泛化层级定义
+# ============================================================
+
+# 年龄泛化：数值 -> 区间
+def generalize_age(age, level=1):
+    age = int(age)
+    if level == 0:
+        return str(age)
+    elif level == 1:
+        low = (age // 10) * 10
+        return f"{low}-{low+9}"
+    elif level == 2:
+        low = (age // 20) * 20
+        return f"{low}-{low+19}"
+    else:
+        return "*"
+
+# 教育泛化层级
+EDUCATION_HIERARCHY = {
+    0: lambda x: x,  # 原始值
+    1: {
+        'Preschool': 'Basic', '1st-4th': 'Basic', '5th-6th': 'Basic',
+        '7th-8th': 'Basic', '9th': 'Basic', '10th': 'Basic',
+        '11th': 'Basic', '12th': 'Basic',
+        'HS-grad': 'High-School',
+        'Some-college': 'College', 'Assoc-voc': 'College', 'Assoc-acdm': 'College',
+        'Bachelors': 'Bachelors',
+        'Masters': 'Advanced', 'Prof-school': 'Advanced', 'Doctorate': 'Advanced'
+    },
+    2: lambda x: '*'
+}
+
+def generalize_education(edu, level=1):
+    if level == 0:
+        return edu
+    elif level == 1:
+        return EDUCATION_HIERARCHY[1].get(edu, edu)
+    else:
+        return '*'
+
+# 种族泛化
+RACE_HIERARCHY = {
+    0: lambda x: x,
+    1: {
+        'White': 'White',
+        'Black': 'Non-White',
+        'Asian-Pac-Islander': 'Non-White',
+        'Amer-Indian-Eskimo': 'Non-White',
+        'Other': 'Non-White'
+    },
+    2: lambda x: '*'
+}
+
+def generalize_race(race, level=1):
+    if level == 0:
+        return race
+    elif level == 1:
+        return RACE_HIERARCHY[1].get(race, race)
+    else:
+        return '*'
+
+# 性别：已是二值，level>=1 泛化为 *
+def generalize_sex(sex, level=1):
+    if level == 0:
+        return sex
+    else:
+        return '*'
+
+# 国籍泛化
+COUNTRY_HIERARCHY = {
+    'United-States': 'North-America',
+    'Cuba': 'Latin-America', 'Jamaica': 'Latin-America',
+    'Mexico': 'Latin-America', 'Puerto-Rico': 'Latin-America',
+    'Canada': 'North-America',
+    'India': 'Asia', 'China': 'Asia', 'Japan': 'Asia',
+    'Philippines': 'Asia', 'Vietnam': 'Asia', 'Taiwan': 'Asia',
+    'South': 'Asia', 'Hong': 'Asia', 'Iran': 'Asia',
+    'Cambodia': 'Asia', 'Laos': 'Asia', 'Thailand': 'Asia',
+    'Germany': 'Europe', 'England': 'Europe', 'Italy': 'Europe',
+    'Poland': 'Europe', 'Portugal': 'Europe', 'France': 'Europe',
+    'Greece': 'Europe', 'Hungary': 'Europe', 'Scotland': 'Europe',
+    'Yugoslavia': 'Europe', 'Holand-Netherlands': 'Europe',
+    'El-Salvador': 'Latin-America', 'Guatemala': 'Latin-America',
+    'Haiti': 'Latin-America', 'Dominican-Republic': 'Latin-America',
+    'Nicaragua': 'Latin-America', 'Peru': 'Latin-America',
+    'Columbia': 'Latin-America', 'Ecuador': 'Latin-America',
+    'Honduras': 'Latin-America', 'Trinadad&Tobago': 'Latin-America',
+    'Outlying-US(Guam-USVI-etc)': 'Other',
+}
+
+def generalize_country(country, level=1):
+    if level == 0:
+        return country
+    elif level == 1:
+        return COUNTRY_HIERARCHY.get(country, 'Other')
+    else:
+        return '*'
+
+
+# ============================================================
+# 3. 泛化函数：对整个DataFrame按给定level泛化
+# ============================================================
+
+def generalize_dataframe(df, levels: dict):
+    """
+    levels: dict, e.g. {'age': 1, 'education': 1, 'race': 1, 'sex': 0, 'native_country': 1}
+    """
+    gdf = df.copy()
+    gdf['age'] = gdf['age'].apply(lambda x: generalize_age(x, levels.get('age', 0)))
+    gdf['education'] = gdf['education'].apply(lambda x: generalize_education(x, levels.get('education', 0)))
+    gdf['race'] = gdf['race'].apply(lambda x: generalize_race(x, levels.get('race', 0)))
+    gdf['sex'] = gdf['sex'].apply(lambda x: generalize_sex(x, levels.get('sex', 0)))
+    gdf['native_country'] = gdf['native_country'].apply(lambda x: generalize_country(x, levels.get('native_country', 0)))
+    return gdf
+
+
+if __name__ == '__main__':
+    main()
