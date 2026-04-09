@@ -9,6 +9,7 @@ __pycache__/
 
 # Build
 build/
+!build/build_exe.bat
 dist/
 *.egg-info/
 

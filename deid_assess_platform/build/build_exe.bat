@@ -1,19 +1,67 @@
 @echo off
 
-rem 安装依赖
-pip install -r requirements.txt
+REM Build script for deid_assess_tool
 
-rem 安装 PyInstaller
-pip install pyinstaller
+REM Check if Python is available
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Error: Python not found. Please install Python and add it to PATH.
+    pause
+    exit /b 1
+)
 
-rem 打包应用程序
+REM Check if pip is available
+pip --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Error: pip not found. Please ensure Python is installed correctly.
+    pause
+    exit /b 1
+)
+
+REM Install dependencies with Tsinghua mirror
+echo Installing dependencies...
+pip install --user -i https://pypi.tuna.tsinghua.edu.cn/simple -r ..\requirements.txt
+if %errorlevel% neq 0 (
+    echo Error: Failed to install dependencies.
+    pause
+    exit /b 1
+)
+
+REM Install PyInstaller with Tsinghua mirror
+echo Installing PyInstaller...
+pip install --user -i https://pypi.tuna.tsinghua.edu.cn/simple pyinstaller
+if %errorlevel% neq 0 (
+    echo Error: Failed to install PyInstaller.
+    pause
+    exit /b 1
+)
+
+REM Create dist directory if it doesn't exist
+if not exist dist mkdir dist
+
+REM Build the application
+echo Building application...
 pyinstaller --onefile --windowed --name deid_assess_tool ..\main.py
+if %errorlevel% neq 0 (
+    echo Error: Failed to build application.
+    pause
+    exit /b 1
+)
 
-rem 复制配置文件和模板
-mkdir -p dist\configkdir -p dist\templateskdir -p dist\data
+REM Copy configuration files and templates
+echo Copying configuration files and templates...
 
-copy ..\config\rules.json dist\config\
-copy ..\templates\* dist\templates\
+if not exist dist\config mkdir dist\config
+if not exist dist\templates mkdir dist\templates
+if not exist dist\data mkdir dist\data
 
-echo 构建完成！可执行文件位于 dist 目录
+if exist ..\config\rules.json (
+    copy ..\config\rules.json dist\config\
+)
+
+if exist ..\templates\* (
+    copy ..\templates\* dist\templates\
+)
+
+echo Build completed! Executable is located in the dist directory
 pause
